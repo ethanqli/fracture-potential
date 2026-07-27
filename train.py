@@ -45,12 +45,38 @@ def combined_loss(logits, targets, ice_mask, bce_weight, dice_weight):
     return loss / (bce_weight + dice_weight)
 
 
+def segmentation_metrics(true_positives, false_positives, false_negatives):
+    """Compute dataset-level binary segmentation metrics from pixel counts."""
+    denominator = 2 * true_positives + false_positives + false_negatives
+    dice = 1.0 if denominator == 0 else 2 * true_positives / denominator
+    precision_denominator = true_positives + false_positives
+    recall_denominator = true_positives + false_negatives
+    precision = (
+        1.0
+        if precision_denominator == 0
+        else true_positives / precision_denominator
+    )
+    recall = (
+        1.0 if recall_denominator == 0 else true_positives / recall_denominator
+    )
+    return {"dice": dice, "precision": precision, "recall": recall}
+
+
 def run_epoch(
-    model, loader, device, bce_weight, dice_weight, optimizer=None
+    model,
+    loader,
+    device,
+    bce_weight,
+    dice_weight,
+    optimizer=None,
+    threshold=0.5,
 ):
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
 
     with torch.set_grad_enabled(training):
         for X_batch, y_batch, ice_batch in loader:
@@ -78,7 +104,25 @@ def run_epoch(
 
             total_loss += loss.item()
 
-    return total_loss / len(loader)
+            with torch.no_grad():
+                valid = ice_batch > 0
+                predictions = torch.sigmoid(logits) >= threshold
+                targets = y_batch > 0.5
+                true_positives += (
+                    predictions & targets & valid
+                ).sum().item()
+                false_positives += (
+                    predictions & ~targets & valid
+                ).sum().item()
+                false_negatives += (
+                    ~predictions & targets & valid
+                ).sum().item()
+
+    metrics = segmentation_metrics(
+        true_positives, false_positives, false_negatives
+    )
+    metrics["loss"] = total_loss / len(loader)
+    return metrics
 
 
 def make_dataset(X, y, region, patch_size, positives, negatives, seed):
@@ -107,6 +151,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default="unet_smoke_test.pt")
     return parser.parse_args()
@@ -118,6 +163,8 @@ def main():
         raise ValueError("Loss weights must be non-negative")
     if args.bce_weight + args.dice_weight == 0:
         raise ValueError("At least one loss weight must be positive")
+    if not 0 <= args.threshold <= 1:
+        raise ValueError("Threshold must be between 0 and 1")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -168,24 +215,35 @@ def main():
 
     best_val_loss = float("inf")
     for epoch in range(args.epochs):
-        train_loss = run_epoch(
+        train_metrics = run_epoch(
             model,
             train_loader,
             device,
             args.bce_weight,
             args.dice_weight,
             optimizer,
+            args.threshold,
         )
-        val_loss = run_epoch(
-            model, val_loader, device, args.bce_weight, args.dice_weight
+        val_metrics = run_epoch(
+            model,
+            val_loader,
+            device,
+            args.bce_weight,
+            args.dice_weight,
+            threshold=args.threshold,
         )
         print(
             f"Epoch {epoch + 1}/{args.epochs} "
-            f"train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
+            f"train_loss={train_metrics['loss']:.6f} "
+            f"train_dice={train_metrics['dice']:.4f} "
+            f"val_loss={val_metrics['loss']:.6f} "
+            f"val_dice={val_metrics['dice']:.4f} "
+            f"val_precision={val_metrics['precision']:.4f} "
+            f"val_recall={val_metrics['recall']:.4f}"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -195,17 +253,26 @@ def main():
                     "base_channels": args.base_channels,
                     "bce_weight": args.bce_weight,
                     "dice_weight": args.dice_weight,
+                    "threshold": args.threshold,
                 },
                 args.checkpoint,
             )
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss = run_epoch(
-        model, test_loader, device, args.bce_weight, args.dice_weight
+    test_metrics = run_epoch(
+        model,
+        test_loader,
+        device,
+        args.bce_weight,
+        args.dice_weight,
+        threshold=args.threshold,
     )
     print(f"Best validation loss: {best_val_loss:.6f}")
-    print(f"Test loss: {test_loss:.6f}")
+    print(f"Test loss: {test_metrics['loss']:.6f}")
+    print(f"Test Dice: {test_metrics['dice']:.4f}")
+    print(f"Test precision: {test_metrics['precision']:.4f}")
+    print(f"Test recall: {test_metrics['recall']:.4f}")
     print(f"Saved best checkpoint to {args.checkpoint}")
 
 
