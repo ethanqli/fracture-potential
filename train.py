@@ -20,7 +20,34 @@ def masked_bce_loss(logits, targets, ice_mask):
     return pixel_loss[valid].mean()
 
 
-def run_epoch(model, loader, device, optimizer=None):
+def masked_dice_loss(logits, targets, ice_mask, smooth=1.0):
+    """Soft Dice loss, averaged per patch over valid ice pixels only."""
+    valid = ice_mask > 0
+    probabilities = torch.sigmoid(logits) * valid
+    masked_targets = targets * valid
+
+    spatial_dims = tuple(range(1, logits.ndim))
+    intersection = (probabilities * masked_targets).sum(dim=spatial_dims)
+    denominator = (
+        probabilities.sum(dim=spatial_dims)
+        + masked_targets.sum(dim=spatial_dims)
+    )
+    dice = (2.0 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - dice.mean()
+
+
+def combined_loss(logits, targets, ice_mask, bce_weight, dice_weight):
+    loss = logits.new_zeros(())
+    if bce_weight:
+        loss = loss + bce_weight * masked_bce_loss(logits, targets, ice_mask)
+    if dice_weight:
+        loss = loss + dice_weight * masked_dice_loss(logits, targets, ice_mask)
+    return loss / (bce_weight + dice_weight)
+
+
+def run_epoch(
+    model, loader, device, bce_weight, dice_weight, optimizer=None
+):
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
@@ -35,7 +62,13 @@ def run_epoch(model, loader, device, optimizer=None):
                 optimizer.zero_grad()
 
             logits = model(X_batch)
-            loss = masked_bce_loss(logits, y_batch, ice_batch)
+            loss = combined_loss(
+                logits,
+                y_batch,
+                ice_batch,
+                bce_weight,
+                dice_weight,
+            )
             if not torch.isfinite(loss):
                 raise RuntimeError("Loss became non-finite")
 
@@ -72,6 +105,8 @@ def parse_args():
     parser.add_argument("--test-per-class", type=int, default=20)
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--bce-weight", type=float, default=0.5)
+    parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default="unet_smoke_test.pt")
     return parser.parse_args()
@@ -79,6 +114,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.bce_weight < 0 or args.dice_weight < 0:
+        raise ValueError("Loss weights must be non-negative")
+    if args.bce_weight + args.dice_weight == 0:
+        raise ValueError("At least one loss weight must be positive")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -129,8 +168,17 @@ def main():
 
     best_val_loss = float("inf")
     for epoch in range(args.epochs):
-        train_loss = run_epoch(model, train_loader, device, optimizer)
-        val_loss = run_epoch(model, val_loader, device)
+        train_loss = run_epoch(
+            model,
+            train_loader,
+            device,
+            args.bce_weight,
+            args.dice_weight,
+            optimizer,
+        )
+        val_loss = run_epoch(
+            model, val_loader, device, args.bce_weight, args.dice_weight
+        )
         print(
             f"Epoch {epoch + 1}/{args.epochs} "
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
@@ -145,13 +193,17 @@ def main():
                     "input_channels": X.shape[0],
                     "patch_size": args.patch_size,
                     "base_channels": args.base_channels,
+                    "bce_weight": args.bce_weight,
+                    "dice_weight": args.dice_weight,
                 },
                 args.checkpoint,
             )
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss = run_epoch(model, test_loader, device)
+    test_loss = run_epoch(
+        model, test_loader, device, args.bce_weight, args.dice_weight
+    )
     print(f"Best validation loss: {best_val_loss:.6f}")
     print(f"Test loss: {test_loss:.6f}")
     print(f"Saved best checkpoint to {args.checkpoint}")
