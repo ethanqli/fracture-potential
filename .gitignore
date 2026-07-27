@@ -1,0 +1,6 @@
+*.tif
+*.tif.aux.xml
+*.mat
+*.pt
+__pycache__/
+.DS_Store

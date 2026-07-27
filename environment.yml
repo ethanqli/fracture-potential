@@ -1,0 +1,8 @@
+name: fracture
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - rasterio
+  - pytorch
