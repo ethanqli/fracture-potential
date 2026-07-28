@@ -125,6 +125,44 @@ def run_epoch(
     return metrics
 
 
+def evaluate_thresholds(model, loader, device, thresholds):
+    """Evaluate several thresholds in one validation inference pass."""
+    model.eval()
+    counts = {
+        threshold: {"tp": 0, "fp": 0, "fn": 0}
+        for threshold in thresholds
+    }
+
+    with torch.no_grad():
+        for X_batch, y_batch, ice_batch in loader:
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
+            ice_batch = ice_batch.to(device, non_blocking=True)
+
+            probabilities = torch.sigmoid(model(X_batch))
+            targets = y_batch > 0.5
+            valid = ice_batch > 0
+
+            for threshold in thresholds:
+                predictions = probabilities >= threshold
+                counts[threshold]["tp"] += (
+                    predictions & targets & valid
+                ).sum().item()
+                counts[threshold]["fp"] += (
+                    predictions & ~targets & valid
+                ).sum().item()
+                counts[threshold]["fn"] += (
+                    ~predictions & targets & valid
+                ).sum().item()
+
+    return {
+        threshold: segmentation_metrics(
+            count["tp"], count["fp"], count["fn"]
+        )
+        for threshold, count in counts.items()
+    }
+
+
 def make_dataset(X, y, region, patch_size, positives, negatives, seed):
     return FracturePatchDataset(
         X_full=X,
@@ -152,6 +190,13 @@ def parse_args():
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
+        help="Validation thresholds used to select the best inference threshold.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default="unet_smoke_test.pt")
     return parser.parse_args()
@@ -165,6 +210,10 @@ def main():
         raise ValueError("At least one loss weight must be positive")
     if not 0 <= args.threshold <= 1:
         raise ValueError("Threshold must be between 0 and 1")
+    if not args.thresholds or any(
+        threshold < 0 or threshold > 1 for threshold in args.thresholds
+    ):
+        raise ValueError("All validation thresholds must be between 0 and 1")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -260,15 +309,39 @@ def main():
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
+    validation_results = evaluate_thresholds(
+        model, val_loader, device, args.thresholds
+    )
+    print("Validation threshold results:")
+    for threshold, metrics in validation_results.items():
+        print(
+            f"threshold={threshold:.2f} "
+            f"dice={metrics['dice']:.4f} "
+            f"precision={metrics['precision']:.4f} "
+            f"recall={metrics['recall']:.4f}"
+        )
+
+    best_threshold = max(
+        validation_results,
+        key=lambda threshold: validation_results[threshold]["dice"],
+    )
+    checkpoint["inference_threshold"] = best_threshold
+    torch.save(checkpoint, args.checkpoint)
+
     test_metrics = run_epoch(
         model,
         test_loader,
         device,
         args.bce_weight,
         args.dice_weight,
-        threshold=args.threshold,
+        threshold=best_threshold,
     )
     print(f"Best validation loss: {best_val_loss:.6f}")
+    print(
+        f"Selected threshold: {best_threshold:.2f} "
+        f"(validation Dice "
+        f"{validation_results[best_threshold]['dice']:.4f})"
+    )
     print(f"Test loss: {test_metrics['loss']:.6f}")
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Test precision: {test_metrics['precision']:.4f}")
