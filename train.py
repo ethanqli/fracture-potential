@@ -125,13 +125,25 @@ def run_epoch(
     return metrics
 
 
-def evaluate_thresholds(model, loader, device, thresholds):
-    """Evaluate several thresholds in one validation inference pass."""
+def validate_epoch(
+    model,
+    loader,
+    device,
+    bce_weight,
+    dice_weight,
+    thresholds,
+    reporting_threshold,
+):
+    """Compute validation loss and threshold metrics in one inference pass."""
     model.eval()
+    evaluated_thresholds = list(
+        dict.fromkeys([reporting_threshold, *thresholds])
+    )
     counts = {
         threshold: {"tp": 0, "fp": 0, "fn": 0}
-        for threshold in thresholds
+        for threshold in evaluated_thresholds
     }
+    total_loss = 0.0
 
     with torch.no_grad():
         for X_batch, y_batch, ice_batch in loader:
@@ -139,11 +151,23 @@ def evaluate_thresholds(model, loader, device, thresholds):
             y_batch = y_batch.to(device, non_blocking=True)
             ice_batch = ice_batch.to(device, non_blocking=True)
 
-            probabilities = torch.sigmoid(model(X_batch))
+            logits = model(X_batch)
+            loss = combined_loss(
+                logits,
+                y_batch,
+                ice_batch,
+                bce_weight,
+                dice_weight,
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError("Loss became non-finite")
+            total_loss += loss.item()
+
+            probabilities = torch.sigmoid(logits)
             targets = y_batch > 0.5
             valid = ice_batch > 0
 
-            for threshold in thresholds:
+            for threshold in evaluated_thresholds:
                 predictions = probabilities >= threshold
                 counts[threshold]["tp"] += (
                     predictions & targets & valid
@@ -155,12 +179,15 @@ def evaluate_thresholds(model, loader, device, thresholds):
                     ~predictions & targets & valid
                 ).sum().item()
 
-    return {
+    threshold_metrics = {
         threshold: segmentation_metrics(
             count["tp"], count["fp"], count["fn"]
         )
         for threshold, count in counts.items()
     }
+    reporting_metrics = threshold_metrics[reporting_threshold].copy()
+    reporting_metrics["loss"] = total_loss / len(loader)
+    return reporting_metrics, threshold_metrics
 
 
 def make_dataset(X, y, region, patch_size, positives, negatives, seed):
@@ -263,6 +290,7 @@ def main():
     )
 
     best_val_loss = float("inf")
+    best_val_dice = -1.0
     for epoch in range(args.epochs):
         train_metrics = run_epoch(
             model,
@@ -273,14 +301,20 @@ def main():
             optimizer,
             args.threshold,
         )
-        val_metrics = run_epoch(
+        val_metrics, validation_results = validate_epoch(
             model,
             val_loader,
             device,
             args.bce_weight,
             args.dice_weight,
-            threshold=args.threshold,
+            args.thresholds,
+            args.threshold,
         )
+        epoch_threshold = max(
+            args.thresholds,
+            key=lambda threshold: validation_results[threshold]["dice"],
+        )
+        epoch_threshold_metrics = validation_results[epoch_threshold]
         print(
             f"Epoch {epoch + 1}/{args.epochs} "
             f"train_loss={train_metrics['loss']:.6f} "
@@ -288,13 +322,17 @@ def main():
             f"val_loss={val_metrics['loss']:.6f} "
             f"val_dice={val_metrics['dice']:.4f} "
             f"val_precision={val_metrics['precision']:.4f} "
-            f"val_recall={val_metrics['recall']:.4f}"
+            f"val_recall={val_metrics['recall']:.4f} "
+            f"best_threshold={epoch_threshold:.2f} "
+            f"tuned_val_dice={epoch_threshold_metrics['dice']:.4f}"
         )
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        best_val_loss = min(best_val_loss, val_metrics["loss"])
+        if epoch_threshold_metrics["dice"] > best_val_dice:
+            best_val_dice = epoch_threshold_metrics["dice"]
             torch.save(
                 {
+                    "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "normalization_stats": normalization_stats,
                     "input_channels": X.shape[0],
@@ -303,30 +341,16 @@ def main():
                     "bce_weight": args.bce_weight,
                     "dice_weight": args.dice_weight,
                     "threshold": args.threshold,
+                    "inference_threshold": epoch_threshold,
+                    "validation_dice": best_val_dice,
+                    "validation_loss": val_metrics["loss"],
                 },
                 args.checkpoint,
             )
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    validation_results = evaluate_thresholds(
-        model, val_loader, device, args.thresholds
-    )
-    print("Validation threshold results:")
-    for threshold, metrics in validation_results.items():
-        print(
-            f"threshold={threshold:.2f} "
-            f"dice={metrics['dice']:.4f} "
-            f"precision={metrics['precision']:.4f} "
-            f"recall={metrics['recall']:.4f}"
-        )
-
-    best_threshold = max(
-        validation_results,
-        key=lambda threshold: validation_results[threshold]["dice"],
-    )
-    checkpoint["inference_threshold"] = best_threshold
-    torch.save(checkpoint, args.checkpoint)
+    best_threshold = checkpoint["inference_threshold"]
 
     test_metrics = run_epoch(
         model,
@@ -336,11 +360,12 @@ def main():
         args.dice_weight,
         threshold=best_threshold,
     )
-    print(f"Best validation loss: {best_val_loss:.6f}")
+    print(f"Lowest observed validation loss: {best_val_loss:.6f}")
     print(
-        f"Selected threshold: {best_threshold:.2f} "
-        f"(validation Dice "
-        f"{validation_results[best_threshold]['dice']:.4f})"
+        f"Selected checkpoint: epoch {checkpoint['epoch']} "
+        f"with threshold {best_threshold:.2f} "
+        f"validation Dice {checkpoint['validation_dice']:.4f} "
+        f"and validation loss {checkpoint['validation_loss']:.6f}"
     )
     print(f"Test loss: {test_metrics['loss']:.6f}")
     print(f"Test Dice: {test_metrics['dice']:.4f}")

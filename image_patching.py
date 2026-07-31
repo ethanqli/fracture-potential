@@ -37,6 +37,7 @@ def make_positive_coords(
     n_patches,
     max_attempts_per_pixel=20,
     max_nan_fraction=0.25,
+    min_positive_pixels=8,
     rng=None,
     allowed_mask=None,
 ):
@@ -81,6 +82,14 @@ def make_positive_coords(
 
             X_patch = X_full[:, row:row+patch_size, col:col+patch_size]
             y_patch = y_full[row:row+patch_size, col:col+patch_size]
+
+            valid_positive_pixels = (
+                (y_patch > 0)
+                & (X_patch[7] > 0)
+            )
+
+            if valid_positive_pixels.sum() < min_positive_pixels:
+                continue
 
             if _invalid_velocity_fraction(X_patch) > max_nan_fraction:
                 continue
