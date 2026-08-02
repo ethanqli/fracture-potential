@@ -8,6 +8,7 @@ from dataset import FracturePatchDataset
 from load_data import load_raw_data, normalize_predictors
 from model import UNet
 from spatial_split import make_spatial_splits
+from visualize_results import plot_training_history, visualize_test_predictions
 
 
 def masked_bce_loss(logits, targets, ice_mask):
@@ -291,6 +292,12 @@ def main():
 
     best_val_loss = float("inf")
     best_val_dice = -1.0
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_dice": [],
+        "val_dice": [],
+    }
     for epoch in range(args.epochs):
         train_metrics = run_epoch(
             model,
@@ -315,6 +322,10 @@ def main():
             key=lambda threshold: validation_results[threshold]["dice"],
         )
         epoch_threshold_metrics = validation_results[epoch_threshold]
+        history["train_loss"].append(train_metrics["loss"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["train_dice"].append(train_metrics["dice"])
+        history["val_dice"].append(epoch_threshold_metrics["dice"])
         print(
             f"Epoch {epoch + 1}/{args.epochs} "
             f"train_loss={train_metrics['loss']:.6f} "
@@ -372,6 +383,15 @@ def main():
     print(f"Test precision: {test_metrics['precision']:.4f}")
     print(f"Test recall: {test_metrics['recall']:.4f}")
     print(f"Saved best checkpoint to {args.checkpoint}")
+
+    plot_training_history(history, output="training_curves.png")
+    visualize_test_predictions(
+        model,
+        test_dataset,
+        device,
+        best_threshold,
+        output="test_predictions.png",
+    )
 
 
 if __name__ == "__main__":
