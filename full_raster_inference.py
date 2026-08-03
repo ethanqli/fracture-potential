@@ -101,6 +101,8 @@ def save_prediction_geotiffs(
         nodata=potential_nodata,
         compress="deflate",
         tiled=True,
+        blockxsize=256,
+        blockysize=256,
         BIGTIFF="IF_SAFER",
     )
     with rasterio.open(potential_path, "w", **profile) as destination:
