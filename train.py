@@ -274,7 +274,7 @@ def main():
     train_dataset = make_dataset(
         X, y, train_region, args.patch_size,
         args.train_per_class, args.train_per_class, args.seed,
-        augment=True, normalization_stats=normalization_stats,
+        augment=False, normalization_stats=normalization_stats,
     )
     val_dataset = make_dataset(
         X, y, val_region, args.patch_size,
