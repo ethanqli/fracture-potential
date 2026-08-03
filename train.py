@@ -191,7 +191,17 @@ def validate_epoch(
     return reporting_metrics, threshold_metrics
 
 
-def make_dataset(X, y, region, patch_size, positives, negatives, seed):
+def make_dataset(
+    X,
+    y,
+    region,
+    patch_size,
+    positives,
+    negatives,
+    seed,
+    augment=False,
+    normalization_stats=None,
+):
     return FracturePatchDataset(
         X_full=X,
         y_full=y,
@@ -201,6 +211,8 @@ def make_dataset(X, y, region, patch_size, positives, negatives, seed):
         positive_patches=positives,
         negative_patches=negatives,
         seed=seed,
+        augment=augment,
+        normalization_stats=normalization_stats,
     )
 
 
@@ -262,6 +274,7 @@ def main():
     train_dataset = make_dataset(
         X, y, train_region, args.patch_size,
         args.train_per_class, args.train_per_class, args.seed,
+        augment=True, normalization_stats=normalization_stats,
     )
     val_dataset = make_dataset(
         X, y, val_region, args.patch_size,
@@ -299,6 +312,10 @@ def main():
         "val_dice": [],
     }
     for epoch in range(args.epochs):
+        # Epoch zero uses the coordinates created during dataset construction;
+        # subsequent epochs receive new deterministic samples.
+        if epoch > 0:
+            train_dataset.resample(args.seed + epoch)
         train_metrics = run_epoch(
             model,
             train_loader,

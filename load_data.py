@@ -37,8 +37,8 @@ def normalize_channel(arr, statistics_valid, output_valid=None):
     return normalized, {"mean": float(mean), "std": float(std)}
 
 
-def load_raw_data():
-    """Load aligned rasters, clean masks, and return unnormalized predictors."""
+def load_raw_predictors():
+    """Load aligned predictor rasters and clean their mask channels."""
     predictor_arrays = []
     reference_grid = None
 
@@ -56,13 +56,6 @@ def load_raw_data():
             predictor_arrays.append(arr)
 
     X = np.stack(predictor_arrays, axis=0)
-    with rasterio.open(TARGET_PATH) as src:
-        if (src.shape, src.transform, src.crs) != reference_grid:
-            raise ValueError(f"{TARGET_PATH} does not match the predictor grid")
-        y = src.read(1).astype("float32")
-        if src.nodata is not None:
-            y[y == src.nodata] = np.nan
-
     # BedMachine mask classes: 2 = grounded ice, 3 = floating ice.
     ice = np.isin(X[7], [2, 3])
     velocity_valid = (
@@ -72,9 +65,24 @@ def load_raw_data():
         & np.isfinite(X[1])
         & np.isfinite(X[2])
     )
-
     X[7] = ice.astype("float32")
     X[8] = velocity_valid.astype("float32")
+    return X
+
+
+def load_raw_data():
+    """Load predictors and the aligned binary fracture target."""
+    X = load_raw_predictors()
+    with rasterio.open(PREDICTOR_PATHS[0]) as reference:
+        reference_grid = (reference.shape, reference.transform, reference.crs)
+    with rasterio.open(TARGET_PATH) as src:
+        if (src.shape, src.transform, src.crs) != reference_grid:
+            raise ValueError(f"{TARGET_PATH} does not match the predictor grid")
+        y = src.read(1).astype("float32")
+        if src.nodata is not None:
+            y[y == src.nodata] = np.nan
+
+    ice = X[7] > 0
     y = (np.isfinite(y) & (y > 0) & ice).astype("float32")
 
     return X, y
@@ -111,6 +119,34 @@ def normalize_predictors(X_raw, train_region, copy=True):
         raise ValueError("X still contains NaN or infinite values")
 
     return X, stats
+
+
+def normalize_predictors_with_stats(X_raw, stats, copy=True):
+    """Normalize predictors using statistics stored in a model checkpoint."""
+    X = X_raw.copy() if copy else X_raw
+    ice = X[7] > 0
+    velocity_valid = ice & (X[8] > 0) & np.isfinite(X[1]) & np.isfinite(X[2])
+    valid_masks = {
+        0: ice & np.isfinite(X[0]),
+        1: velocity_valid,
+        2: velocity_valid,
+        3: ice & np.isfinite(X[3]),
+        4: ice & np.isfinite(X[4]),
+        5: velocity_valid & np.isfinite(X[5]),
+        6: velocity_valid & np.isfinite(X[6]),
+    }
+
+    for channel, valid in valid_masks.items():
+        channel_stats = stats[channel]
+        mean = channel_stats["mean"]
+        std = max(channel_stats["std"], 1e-6)
+        normalized = np.zeros(X[channel].shape, dtype="float32")
+        normalized[valid] = ((X[channel][valid] - mean) / std).astype("float32")
+        X[channel] = normalized
+
+    if not np.isfinite(X).all():
+        raise ValueError("X still contains NaN or infinite values")
+    return X
 
 
 def load_data(train_region=None, return_stats=False):

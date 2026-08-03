@@ -40,6 +40,7 @@ def make_positive_coords(
     min_positive_pixels=8,
     rng=None,
     allowed_mask=None,
+    positive_pixel_pool=None,
 ):
     _, H, W = _validate_inputs(y_full, X_full, patch_size, n_patches)
     if max_attempts_per_pixel <= 0:
@@ -50,10 +51,15 @@ def make_positive_coords(
             f"allowed_mask shape {allowed_mask.shape} must match {(H, W)}"
         )
 
-    positive_pixels = y_full > 0
-    if allowed_mask is not None:
-        positive_pixels &= allowed_mask
-    frac_rows, frac_cols = np.where(positive_pixels)
+    if positive_pixel_pool is None:
+        positive_pixels = y_full > 0
+        if allowed_mask is not None:
+            positive_pixels &= allowed_mask
+        frac_rows, frac_cols = np.where(positive_pixels)
+    else:
+        frac_rows, frac_cols = positive_pixel_pool
+        if len(frac_rows) != len(frac_cols):
+            raise ValueError("positive_pixel_pool row and column lengths differ")
 
     if len(frac_rows) == 0:
         raise ValueError("y_full does not contain any positive fracture pixels")

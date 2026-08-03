@@ -16,33 +16,61 @@ class FracturePatchDataset(Dataset):
         max_attempts_per_positive_pixel=20,
         seed=None,
         allowed_mask=None,
+        augment=False,
+        normalization_stats=None,
     ):
         self.X_full = X_full
         self.y_full = y_full
         self.ice_mask = ice_mask
+        self.patch_size = patch_size
+        self.positive_patches = positive_patches
+        self.negative_patches = negative_patches
+        self.max_attempts_per_positive_pixel = max_attempts_per_positive_pixel
+        self.allowed_mask = allowed_mask
+        self.augment = augment
+        self.normalization_stats = normalization_stats
+        if augment and (
+            normalization_stats is None
+            or 1 not in normalization_stats
+            or 2 not in normalization_stats
+        ):
+            raise ValueError(
+                "Velocity normalization statistics are required for augmentation"
+            )
+
+        # Finding every eligible fracture pixel is expensive on a large raster,
+        # so cache this pool and reuse it when patch locations are resampled.
+        positive_pixels = y_full > 0
+        if allowed_mask is not None:
+            positive_pixels &= allowed_mask
+        self.positive_pixel_pool = np.where(positive_pixels)
+        self.resample(seed)
+
+    def resample(self, seed=None):
+        """Generate a new balanced set of patch coordinates."""
         rng = np.random.default_rng(seed)
         positive_coords = make_positive_coords(
-            y_full,
-            X_full,
-            patch_size,
-            positive_patches,
-            max_attempts_per_pixel=max_attempts_per_positive_pixel,
+            self.y_full,
+            self.X_full,
+            self.patch_size,
+            self.positive_patches,
+            max_attempts_per_pixel=self.max_attempts_per_positive_pixel,
             rng=rng,
-            allowed_mask=allowed_mask,
+            allowed_mask=self.allowed_mask,
+            positive_pixel_pool=self.positive_pixel_pool,
         )
         negative_coords = make_negative_coords(
-            y_full,
-            X_full,
-            ice_mask,
-            patch_size,
-            negative_patches,
+            self.y_full,
+            self.X_full,
+            self.ice_mask,
+            self.patch_size,
+            self.negative_patches,
             rng=rng,
-            allowed_mask=allowed_mask,
+            allowed_mask=self.allowed_mask,
         )
         coords = positive_coords + negative_coords
         rng.shuffle(coords)
-        self.patch_coords = coords        
-        self.patch_size = patch_size
+        self.patch_coords = coords
 
     def __len__(self):
         return len(self.patch_coords)
@@ -58,5 +86,43 @@ class FracturePatchDataset(Dataset):
         X_patch = torch.from_numpy(X_patch).float()
         y_patch = torch.from_numpy(y_patch).float().unsqueeze(0)
         ice_patch = torch.from_numpy(ice_patch > 0).float().unsqueeze(0)
+
+        if self.augment:
+            # Apply the same random dihedral transform to predictors, target,
+            # and validity mask. Velocity components are converted back to raw
+            # units so the vector itself can be transformed consistently.
+            vx_stats = self.normalization_stats[1]
+            vy_stats = self.normalization_stats[2]
+            vx = X_patch[1] * vx_stats["std"] + vx_stats["mean"]
+            vy = X_patch[2] * vy_stats["std"] + vy_stats["mean"]
+
+            k = int(torch.randint(0, 4, ()).item())
+            if k:
+                X_patch = torch.rot90(X_patch, k, dims=(-2, -1))
+                y_patch = torch.rot90(y_patch, k, dims=(-2, -1))
+                ice_patch = torch.rot90(ice_patch, k, dims=(-2, -1))
+                vx = torch.rot90(vx, k, dims=(-2, -1))
+                vy = torch.rot90(vy, k, dims=(-2, -1))
+                if k == 1:
+                    vx, vy = -vy, vx
+                elif k == 2:
+                    vx, vy = -vx, -vy
+                else:
+                    vx, vy = vy, -vx
+            if bool(torch.randint(0, 2, ()).item()):
+                X_patch = torch.flip(X_patch, dims=(-1,))
+                y_patch = torch.flip(y_patch, dims=(-1,))
+                ice_patch = torch.flip(ice_patch, dims=(-1,))
+                vx = -torch.flip(vx, dims=(-1,))
+                vy = torch.flip(vy, dims=(-1,))
+
+            # rot90/flip can return views into the full raster. Clone before
+            # overwriting the velocity channels to leave the source unchanged.
+            X_patch = X_patch.clone()
+            X_patch[1] = (vx - vx_stats["mean"]) / max(vx_stats["std"], 1e-6)
+            X_patch[2] = (vy - vy_stats["mean"]) / max(vy_stats["std"], 1e-6)
+            velocity_valid = X_patch[8] > 0
+            X_patch[1] = torch.where(velocity_valid, X_patch[1], 0.0)
+            X_patch[2] = torch.where(velocity_valid, X_patch[2], 0.0)
 
         return X_patch, y_patch, ice_patch
