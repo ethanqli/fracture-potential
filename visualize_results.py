@@ -74,7 +74,9 @@ def visualize_test_predictions(
     if len(dataset) == 0:
         raise ValueError("Cannot visualize an empty dataset")
 
-    error_cmap = ListedColormap(["#e6e6e6", "#e66101", "#5e3c99"])
+    result_cmap = ListedColormap(
+        ["#e6e6e6", "#1b9e77", "#e66101", "#5e3c99"]
+    )
 
     was_training = model.training
     model.eval()
@@ -162,17 +164,24 @@ def visualize_test_predictions(
 
             # Channel zero is normalized ice thickness.
             thickness = np.ma.masked_where(~valid, X_patch[0].numpy())
-            errors = np.zeros(target.shape, dtype=np.uint8)
-            errors[prediction & ~target] = 1
-            errors[~prediction & target & valid] = 2
-            errors = np.ma.masked_where(~valid, errors)
+            results = np.zeros(target.shape, dtype=np.uint8)
+            results[prediction & target] = 1
+            results[prediction & ~target] = 2
+            results[~prediction & target & valid] = 3
+            results = np.ma.masked_where(~valid, results)
 
             panels = (
                 (thickness, "Thickness", "gray", None, None),
                 (np.ma.masked_where(~valid, target), "Ground truth", "gray", 0, 1),
                 (probability, "Fracture probability", "magma", 0, 1),
                 (np.ma.masked_where(~valid, prediction), f"Prediction >= {threshold:.2f}", "gray", 0, 1),
-                (errors, "Errors: FP=orange, FN=purple", error_cmap, 0, 2),
+                (
+                    results,
+                    "Results: TP=green, FP=orange, FN=purple",
+                    result_cmap,
+                    0,
+                    3,
+                ),
             )
 
             for column, (image, title, cmap, vmin, vmax) in enumerate(panels):
