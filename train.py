@@ -2,6 +2,7 @@ import argparse
 
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import DataLoader
 
 from dataset import FracturePatchDataset
@@ -191,6 +192,40 @@ def validate_epoch(
     return reporting_metrics, threshold_metrics
 
 
+def evaluate_by_fracture_density(model, loader, device, threshold):
+    """Return pixel metrics for sparse, medium, and dense positive patches."""
+    bins = {
+        "sparse (1-31 px)": {"tp": 0, "fp": 0, "fn": 0, "patches": 0},
+        "medium (32-127 px)": {"tp": 0, "fp": 0, "fn": 0, "patches": 0},
+        "dense (128+ px)": {"tp": 0, "fp": 0, "fn": 0, "patches": 0},
+    }
+    names = list(bins)
+    model.eval()
+    with torch.inference_mode():
+        for X_batch, y_batch, ice_batch in loader:
+            probabilities = torch.sigmoid(model(X_batch.to(device))).cpu()
+            for item in range(len(X_batch)):
+                target = y_batch[item, 0] > 0.5
+                valid = ice_batch[item, 0] > 0
+                positive_count = int((target & valid).sum().item())
+                if positive_count == 0:
+                    continue
+                bin_index = 0 if positive_count < 32 else (1 if positive_count < 128 else 2)
+                counts = bins[names[bin_index]]
+                prediction = probabilities[item, 0] >= threshold
+                counts["tp"] += int((prediction & target & valid).sum().item())
+                counts["fp"] += int((prediction & ~target & valid).sum().item())
+                counts["fn"] += int((~prediction & target & valid).sum().item())
+                counts["patches"] += 1
+
+    results = {}
+    for name, counts in bins.items():
+        metrics = segmentation_metrics(counts["tp"], counts["fp"], counts["fn"])
+        metrics["patches"] = counts["patches"]
+        results[name] = metrics
+    return results
+
+
 def make_dataset(
     X,
     y,
@@ -201,6 +236,9 @@ def make_dataset(
     seed,
     augment=False,
     normalization_stats=None,
+    positive_density_upper_bounds=None,
+    boundary_distance=None,
+    min_positive_pixels=8,
 ):
     return FracturePatchDataset(
         X_full=X,
@@ -213,6 +251,9 @@ def make_dataset(
         seed=seed,
         augment=augment,
         normalization_stats=normalization_stats,
+        positive_density_upper_bounds=positive_density_upper_bounds,
+        boundary_distance=boundary_distance,
+        min_positive_pixels=min_positive_pixels,
     )
 
 
@@ -239,6 +280,28 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default="unet_smoke_test.pt")
+    parser.add_argument(
+        "--stratified-positive-sampling",
+        action="store_true",
+        help="Sample equal counts of 1-31, 32-127, and 128+ pixel positive patches.",
+    )
+    parser.add_argument(
+        "--boundary-matched-negatives",
+        action="store_true",
+        help="Match negative patches to positive-patch ice-boundary distances.",
+    )
+    parser.add_argument(
+        "--resample-each-epoch",
+        action="store_true",
+        help="Regenerate training coordinates each epoch instead of keeping them fixed.",
+    )
+    parser.add_argument("--training-min-positive-pixels", type=int, default=1)
+    parser.add_argument(
+        "--evaluation-min-positive-pixels",
+        type=int,
+        default=8,
+        help="Keep at 8 to preserve comparability with earlier validation/test sets.",
+    )
     return parser.parse_args()
 
 
@@ -254,6 +317,11 @@ def main():
         threshold < 0 or threshold > 1 for threshold in args.thresholds
     ):
         raise ValueError("All validation thresholds must be between 0 and 1")
+    if (
+        args.training_min_positive_pixels <= 0
+        or args.evaluation_min_positive_pixels <= 0
+    ):
+        raise ValueError("minimum positive-pixel counts must be positive")
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -271,19 +339,36 @@ def main():
     )
     print("X shape:", X.shape, "y shape:", y.shape)
 
+    boundary_distance = None
+    if args.boundary_matched_negatives:
+        print("Computing distance to the nearest non-ice pixel...")
+        # Distances are only used for integer bins; uint16 halves memory versus
+        # float32 and easily covers this raster's dimensions.
+        boundary_distance = distance_transform_edt(X[7] > 0).astype("uint16")
+    density_bounds = (32, 128) if args.stratified_positive_sampling else None
+
     train_dataset = make_dataset(
         X, y, train_region, args.patch_size,
         args.train_per_class, args.train_per_class, args.seed,
         augment=False, normalization_stats=normalization_stats,
+        positive_density_upper_bounds=density_bounds,
+        boundary_distance=boundary_distance,
+        min_positive_pixels=args.training_min_positive_pixels,
     )
     val_dataset = make_dataset(
         X, y, val_region, args.patch_size,
         args.val_per_class, args.val_per_class, args.seed + 1,
+        min_positive_pixels=args.evaluation_min_positive_pixels,
     )
     test_dataset = make_dataset(
         X, y, test_region, args.patch_size,
         args.test_per_class, args.test_per_class, args.seed + 2,
+        min_positive_pixels=args.evaluation_min_positive_pixels,
     )
+    if args.stratified_positive_sampling:
+        print("Training positive density-bin counts:", train_dataset.positive_density_counts)
+    if args.boundary_matched_negatives:
+        print("Matched boundary-distance bin counts:", train_dataset.boundary_bin_counts)
 
     loader_args = {
         "batch_size": args.batch_size,
@@ -314,7 +399,7 @@ def main():
     for epoch in range(args.epochs):
         # Epoch zero uses the coordinates created during dataset construction;
         # subsequent epochs receive new deterministic samples.
-        if epoch > 0:
+        if args.resample_each_epoch and epoch > 0:
             train_dataset.resample(args.seed + epoch)
         train_metrics = run_epoch(
             model,
@@ -372,6 +457,10 @@ def main():
                     "inference_threshold": epoch_threshold,
                     "validation_dice": best_val_dice,
                     "validation_loss": val_metrics["loss"],
+                    "stratified_positive_sampling": args.stratified_positive_sampling,
+                    "boundary_matched_negatives": args.boundary_matched_negatives,
+                    "training_min_positive_pixels": args.training_min_positive_pixels,
+                    "evaluation_min_positive_pixels": args.evaluation_min_positive_pixels,
                 },
                 args.checkpoint,
             )
@@ -399,6 +488,15 @@ def main():
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Test precision: {test_metrics['precision']:.4f}")
     print(f"Test recall: {test_metrics['recall']:.4f}")
+    density_metrics = evaluate_by_fracture_density(
+        model, test_loader, device, best_threshold
+    )
+    for name, metrics in density_metrics.items():
+        print(
+            f"Test {name}: patches={metrics['patches']} "
+            f"dice={metrics['dice']:.4f} precision={metrics['precision']:.4f} "
+            f"recall={metrics['recall']:.4f}"
+        )
     print(f"Saved best checkpoint to {args.checkpoint}")
 
     plot_training_history(history, output="training_curves.png")

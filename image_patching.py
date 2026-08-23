@@ -30,6 +30,15 @@ def _patch_is_allowed(allowed_mask, row, col, patch_size):
     return patch.shape == (patch_size, patch_size) and patch.all()
 
 
+def _bin_index(value, upper_bounds):
+    return int(np.searchsorted(upper_bounds, value, side="right"))
+
+
+def patch_positive_count(y_full, ice_mask, row, col, patch_size):
+    region = np.s_[row:row + patch_size, col:col + patch_size]
+    return int(((y_full[region] > 0) & (ice_mask[region] > 0)).sum())
+
+
 def make_positive_coords(
     y_full,
     X_full,
@@ -41,6 +50,7 @@ def make_positive_coords(
     rng=None,
     allowed_mask=None,
     positive_pixel_pool=None,
+    density_upper_bounds=None,
 ):
     _, H, W = _validate_inputs(y_full, X_full, patch_size, n_patches)
     if max_attempts_per_pixel <= 0:
@@ -67,7 +77,24 @@ def make_positive_coords(
     coords = []
     seen = set()
     rng = rng or np.random.default_rng()
-    fracture_indices = rng.permutation(len(frac_rows))
+    density_upper_bounds = (
+        tuple(density_upper_bounds) if density_upper_bounds is not None else None
+    )
+    if density_upper_bounds is not None:
+        if tuple(sorted(density_upper_bounds)) != density_upper_bounds:
+            raise ValueError("density_upper_bounds must be sorted")
+        n_bins = len(density_upper_bounds) + 1
+        base, remainder = divmod(n_patches, n_bins)
+        quotas = [base + (i < remainder) for i in range(n_bins)]
+        counts = [0] * n_bins
+        # Repeated draws allow sparse fracture pixels to yield several distinct
+        # placements, while `seen` still prevents duplicate patches.
+        fracture_indices = rng.integers(
+            0, len(frac_rows), size=max(len(frac_rows), n_patches * 500)
+        )
+    else:
+        quotas = counts = None
+        fracture_indices = rng.permutation(len(frac_rows))
 
     for i in fracture_indices:
         frac_row = frac_rows[i]
@@ -94,8 +121,14 @@ def make_positive_coords(
                 & (X_patch[7] > 0)
             )
 
-            if valid_positive_pixels.sum() < min_positive_pixels:
+            positive_count = int(valid_positive_pixels.sum())
+            if positive_count < min_positive_pixels:
                 continue
+
+            if density_upper_bounds is not None:
+                density_bin = _bin_index(positive_count, density_upper_bounds)
+                if counts[density_bin] >= quotas[density_bin]:
+                    continue
 
             if _invalid_velocity_fraction(X_patch) > max_nan_fraction:
                 continue
@@ -105,6 +138,8 @@ def make_positive_coords(
 
             seen.add((row, col))
             coords.append((row, col))
+            if density_upper_bounds is not None:
+                counts[density_bin] += 1
             break
 
         if len(coords) == n_patches:
@@ -117,7 +152,8 @@ def make_positive_coords(
             f"{len(fracture_indices)} fracture pixels with up to "
             f"{max_attempts_per_pixel} patch placements each. Try reducing "
             "n_patches, increasing max_attempts_per_pixel, using a smaller "
-            "patch_size, or relaxing max_nan_fraction."
+            "patch_size, relaxing max_nan_fraction, or changing the density "
+            f"bins. Density-bin counts: {counts}."
         )
 
     return coords
@@ -134,6 +170,9 @@ def make_negative_coords(
     min_ice_fraction=0.25,
     rng=None,
     allowed_mask=None,
+    boundary_distance=None,
+    boundary_upper_bounds=(8, 32, 128),
+    target_boundary_counts=None,
 ):
     _, H, W = _validate_inputs(y_full, X_full, patch_size, n_patches)
     if ice_mask.shape != (H, W):
@@ -148,8 +187,22 @@ def make_negative_coords(
     coords = []
     seen = set()
     attempts = 0
-    max_attempts = max_attempts or max(1000, n_patches * 200)
+    attempts_per_patch = 500 if target_boundary_counts is not None else 200
+    max_attempts = max_attempts or max(1000, n_patches * attempts_per_patch)
     rng = rng or np.random.default_rng()
+    if target_boundary_counts is not None:
+        if boundary_distance is None or boundary_distance.shape != (H, W):
+            raise ValueError(
+                "A full-size boundary_distance raster is required for matching"
+            )
+        expected_bins = len(boundary_upper_bounds) + 1
+        if len(target_boundary_counts) != expected_bins:
+            raise ValueError("target_boundary_counts has the wrong number of bins")
+        if sum(target_boundary_counts) != n_patches:
+            raise ValueError("target_boundary_counts must sum to n_patches")
+        boundary_counts = [0] * expected_bins
+    else:
+        boundary_counts = None
 
     while len(coords) < n_patches and attempts < max_attempts:
         attempts += 1
@@ -175,15 +228,27 @@ def make_negative_coords(
         if np.nanmean(ice_patch > 0) < min_ice_fraction:
             continue
 
+        if boundary_counts is not None:
+            center_row = row + patch_size // 2
+            center_col = col + patch_size // 2
+            boundary_bin = _bin_index(
+                boundary_distance[center_row, center_col], boundary_upper_bounds
+            )
+            if boundary_counts[boundary_bin] >= target_boundary_counts[boundary_bin]:
+                continue
+
         seen.add((row, col))
         coords.append((row, col))
+        if boundary_counts is not None:
+            boundary_counts[boundary_bin] += 1
 
     if len(coords) < n_patches:
         raise RuntimeError(
             "Could not sample enough negative patches: "
             f"requested {n_patches}, found {len(coords)} after {attempts} attempts. "
             "Try reducing n_patches, increasing max_attempts, using a smaller "
-            "patch_size, relaxing max_nan_fraction, or lowering min_ice_fraction."
+            "patch_size, relaxing max_nan_fraction, lowering min_ice_fraction, "
+            f"or widening boundary bins. Boundary-bin counts: {boundary_counts}."
         )
 
     return coords
