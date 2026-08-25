@@ -64,6 +64,94 @@ def segmentation_metrics(true_positives, false_positives, false_negatives):
     return {"dice": dice, "precision": precision, "recall": recall}
 
 
+def dilate_binary_mask(mask, radius):
+    """Dilate a BCHW Boolean mask by an integer pixel radius."""
+    if radius < 0:
+        raise ValueError("Dilation radius must be non-negative")
+    if radius == 0:
+        return mask
+    kernel_size = 2 * radius + 1
+    return F.max_pool2d(
+        mask.float(),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=radius,
+    ) > 0
+
+
+def boundary_tolerant_metrics(model, loader, device, threshold, radii=(1, 2)):
+    """Evaluate segmentation allowing predictions within each pixel radius.
+
+    Precision matches each predicted pixel against a dilated target, while
+    recall matches each target pixel against a dilated prediction. Counts are
+    accumulated over the full dataset before computing the metrics.
+    """
+    radii = tuple(dict.fromkeys(radii))
+    counts = {
+        radius: {
+            "matched_predictions": 0,
+            "predicted_pixels": 0,
+            "matched_targets": 0,
+            "target_pixels": 0,
+        }
+        for radius in radii
+    }
+
+    model.eval()
+    with torch.inference_mode():
+        for X_batch, y_batch, ice_batch in loader:
+            X_batch = X_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
+            ice_batch = ice_batch.to(device, non_blocking=True)
+
+            valid = ice_batch > 0
+            predictions = (torch.sigmoid(model(X_batch)) >= threshold) & valid
+            targets = (y_batch > 0.5) & valid
+
+            predicted_pixels = predictions.sum().item()
+            target_pixels = targets.sum().item()
+            for radius in radii:
+                expanded_targets = dilate_binary_mask(targets, radius) & valid
+                expanded_predictions = (
+                    dilate_binary_mask(predictions, radius) & valid
+                )
+                radius_counts = counts[radius]
+                radius_counts["matched_predictions"] += (
+                    predictions & expanded_targets
+                ).sum().item()
+                radius_counts["predicted_pixels"] += predicted_pixels
+                radius_counts["matched_targets"] += (
+                    targets & expanded_predictions
+                ).sum().item()
+                radius_counts["target_pixels"] += target_pixels
+
+    results = {}
+    for radius, radius_counts in counts.items():
+        predicted_pixels = radius_counts["predicted_pixels"]
+        target_pixels = radius_counts["target_pixels"]
+        if predicted_pixels == 0:
+            precision = 1.0 if target_pixels == 0 else 0.0
+        else:
+            precision = (
+                radius_counts["matched_predictions"] / predicted_pixels
+            )
+        if target_pixels == 0:
+            recall = 1.0 if predicted_pixels == 0 else 0.0
+        else:
+            recall = radius_counts["matched_targets"] / target_pixels
+        dice = (
+            0.0
+            if precision + recall == 0
+            else 2.0 * precision * recall / (precision + recall)
+        )
+        results[radius] = {
+            "dice": dice,
+            "precision": precision,
+            "recall": recall,
+        }
+    return results
+
+
 def run_epoch(
     model,
     loader,
@@ -278,6 +366,13 @@ def parse_args():
         default=[0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5],
         help="Validation thresholds used to select the best inference threshold.",
     )
+    parser.add_argument(
+        "--boundary-tolerances",
+        type=int,
+        nargs="+",
+        default=[1, 2],
+        help="Pixel radii used for boundary-tolerant test metrics.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint", default="unet_smoke_test.pt")
     parser.add_argument(
@@ -317,6 +412,10 @@ def main():
         threshold < 0 or threshold > 1 for threshold in args.thresholds
     ):
         raise ValueError("All validation thresholds must be between 0 and 1")
+    if not args.boundary_tolerances or any(
+        radius < 0 for radius in args.boundary_tolerances
+    ):
+        raise ValueError("Boundary tolerances must be non-negative integers")
     if (
         args.training_min_positive_pixels <= 0
         or args.evaluation_min_positive_pixels <= 0
@@ -488,6 +587,19 @@ def main():
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Test precision: {test_metrics['precision']:.4f}")
     print(f"Test recall: {test_metrics['recall']:.4f}")
+    tolerant_metrics = boundary_tolerant_metrics(
+        model,
+        test_loader,
+        device,
+        best_threshold,
+        args.boundary_tolerances,
+    )
+    for radius, metrics in tolerant_metrics.items():
+        print(
+            f"Test tolerance {radius} px: dice={metrics['dice']:.4f} "
+            f"precision={metrics['precision']:.4f} "
+            f"recall={metrics['recall']:.4f}"
+        )
     density_metrics = evaluate_by_fracture_density(
         model, test_loader, device, best_threshold
     )
