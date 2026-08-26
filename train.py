@@ -38,13 +38,65 @@ def masked_dice_loss(logits, targets, ice_mask, smooth=1.0):
     return 1.0 - dice.mean()
 
 
-def combined_loss(logits, targets, ice_mask, bce_weight, dice_weight):
+def masked_tversky_loss(
+    logits,
+    targets,
+    ice_mask,
+    alpha=0.3,
+    beta=0.7,
+    smooth=1.0,
+):
+    """Soft Tversky loss over valid ice pixels, averaged per patch.
+
+    Alpha weights false positives and beta weights false negatives.
+    """
+    valid = (ice_mask > 0).to(logits.dtype)
+    probabilities = torch.sigmoid(logits) * valid
+    masked_targets = targets * valid
+
+    spatial_dims = tuple(range(1, logits.ndim))
+    true_positives = (
+        probabilities * masked_targets
+    ).sum(dim=spatial_dims)
+    false_positives = (
+        probabilities * (1.0 - masked_targets) * valid
+    ).sum(dim=spatial_dims)
+    false_negatives = (
+        (1.0 - probabilities) * masked_targets
+    ).sum(dim=spatial_dims)
+    tversky = (true_positives + smooth) / (
+        true_positives
+        + alpha * false_positives
+        + beta * false_negatives
+        + smooth
+    )
+    return 1.0 - tversky.mean()
+
+
+def combined_loss(
+    logits,
+    targets,
+    ice_mask,
+    bce_weight,
+    dice_weight,
+    tversky_weight=0.0,
+    tversky_alpha=0.3,
+    tversky_beta=0.7,
+):
     loss = logits.new_zeros(())
     if bce_weight:
         loss = loss + bce_weight * masked_bce_loss(logits, targets, ice_mask)
     if dice_weight:
         loss = loss + dice_weight * masked_dice_loss(logits, targets, ice_mask)
-    return loss / (bce_weight + dice_weight)
+    if tversky_weight:
+        loss = loss + tversky_weight * masked_tversky_loss(
+            logits,
+            targets,
+            ice_mask,
+            alpha=tversky_alpha,
+            beta=tversky_beta,
+        )
+    return loss / (bce_weight + dice_weight + tversky_weight)
 
 
 def segmentation_metrics(true_positives, false_positives, false_negatives):
@@ -79,20 +131,21 @@ def dilate_binary_mask(mask, radius):
     ) > 0
 
 
-def boundary_tolerant_metrics(model, loader, device, threshold, radii=(1, 2)):
-    """Evaluate segmentation allowing predictions within each pixel radius.
-
-    Precision matches each predicted pixel against a dilated target, while
-    recall matches each target pixel against a dilated prediction. Counts are
-    accumulated over the full dataset before computing the metrics.
-    """
+def boundary_tolerant_threshold_metrics(
+    model, loader, device, thresholds, radii=(1, 2)
+):
+    """Evaluate tolerant metrics for several thresholds in one inference pass."""
     radii = tuple(dict.fromkeys(radii))
+    thresholds = tuple(dict.fromkeys(thresholds))
     counts = {
         radius: {
-            "matched_predictions": 0,
-            "predicted_pixels": 0,
-            "matched_targets": 0,
-            "target_pixels": 0,
+            threshold: {
+                "matched_predictions": 0,
+                "predicted_pixels": 0,
+                "matched_targets": 0,
+                "target_pixels": 0,
+            }
+            for threshold in thresholds
         }
         for radius in radii
     }
@@ -105,51 +158,66 @@ def boundary_tolerant_metrics(model, loader, device, threshold, radii=(1, 2)):
             ice_batch = ice_batch.to(device, non_blocking=True)
 
             valid = ice_batch > 0
-            predictions = (torch.sigmoid(model(X_batch)) >= threshold) & valid
+            probabilities = torch.sigmoid(model(X_batch))
             targets = (y_batch > 0.5) & valid
-
-            predicted_pixels = predictions.sum().item()
             target_pixels = targets.sum().item()
             for radius in radii:
                 expanded_targets = dilate_binary_mask(targets, radius) & valid
-                expanded_predictions = (
-                    dilate_binary_mask(predictions, radius) & valid
-                )
-                radius_counts = counts[radius]
-                radius_counts["matched_predictions"] += (
-                    predictions & expanded_targets
-                ).sum().item()
-                radius_counts["predicted_pixels"] += predicted_pixels
-                radius_counts["matched_targets"] += (
-                    targets & expanded_predictions
-                ).sum().item()
-                radius_counts["target_pixels"] += target_pixels
+                for threshold in thresholds:
+                    predictions = (probabilities >= threshold) & valid
+                    expanded_predictions = (
+                        dilate_binary_mask(predictions, radius) & valid
+                    )
+                    threshold_counts = counts[radius][threshold]
+                    threshold_counts["matched_predictions"] += (
+                        predictions & expanded_targets
+                    ).sum().item()
+                    threshold_counts["predicted_pixels"] += (
+                        predictions.sum().item()
+                    )
+                    threshold_counts["matched_targets"] += (
+                        targets & expanded_predictions
+                    ).sum().item()
+                    threshold_counts["target_pixels"] += target_pixels
 
     results = {}
     for radius, radius_counts in counts.items():
-        predicted_pixels = radius_counts["predicted_pixels"]
-        target_pixels = radius_counts["target_pixels"]
-        if predicted_pixels == 0:
-            precision = 1.0 if target_pixels == 0 else 0.0
-        else:
-            precision = (
-                radius_counts["matched_predictions"] / predicted_pixels
+        results[radius] = {}
+        for threshold, threshold_counts in radius_counts.items():
+            predicted_pixels = threshold_counts["predicted_pixels"]
+            target_pixels = threshold_counts["target_pixels"]
+            if predicted_pixels == 0:
+                precision = 1.0 if target_pixels == 0 else 0.0
+            else:
+                precision = (
+                    threshold_counts["matched_predictions"] / predicted_pixels
+                )
+            if target_pixels == 0:
+                recall = 1.0 if predicted_pixels == 0 else 0.0
+            else:
+                recall = threshold_counts["matched_targets"] / target_pixels
+            dice = (
+                0.0
+                if precision + recall == 0
+                else 2.0 * precision * recall / (precision + recall)
             )
-        if target_pixels == 0:
-            recall = 1.0 if predicted_pixels == 0 else 0.0
-        else:
-            recall = radius_counts["matched_targets"] / target_pixels
-        dice = (
-            0.0
-            if precision + recall == 0
-            else 2.0 * precision * recall / (precision + recall)
-        )
-        results[radius] = {
-            "dice": dice,
-            "precision": precision,
-            "recall": recall,
-        }
+            results[radius][threshold] = {
+                "dice": dice,
+                "precision": precision,
+                "recall": recall,
+            }
     return results
+
+
+def boundary_tolerant_metrics(model, loader, device, threshold, radii=(1, 2)):
+    """Evaluate segmentation allowing predictions within each pixel radius."""
+    threshold_results = boundary_tolerant_threshold_metrics(
+        model, loader, device, [threshold], radii
+    )
+    return {
+        radius: results[threshold]
+        for radius, results in threshold_results.items()
+    }
 
 
 def run_epoch(
@@ -158,6 +226,9 @@ def run_epoch(
     device,
     bce_weight,
     dice_weight,
+    tversky_weight=0.0,
+    tversky_alpha=0.3,
+    tversky_beta=0.7,
     optimizer=None,
     threshold=0.5,
 ):
@@ -184,6 +255,9 @@ def run_epoch(
                 ice_batch,
                 bce_weight,
                 dice_weight,
+                tversky_weight,
+                tversky_alpha,
+                tversky_beta,
             )
             if not torch.isfinite(loss):
                 raise RuntimeError("Loss became non-finite")
@@ -221,6 +295,9 @@ def validate_epoch(
     device,
     bce_weight,
     dice_weight,
+    tversky_weight,
+    tversky_alpha,
+    tversky_beta,
     thresholds,
     reporting_threshold,
 ):
@@ -248,6 +325,9 @@ def validate_epoch(
                 ice_batch,
                 bce_weight,
                 dice_weight,
+                tversky_weight,
+                tversky_alpha,
+                tversky_beta,
             )
             if not torch.isfinite(loss):
                 raise RuntimeError("Loss became non-finite")
@@ -358,6 +438,24 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
+    parser.add_argument(
+        "--tversky-weight",
+        type=float,
+        default=0.0,
+        help="Weight of Tversky loss in the normalized combined loss.",
+    )
+    parser.add_argument(
+        "--tversky-alpha",
+        type=float,
+        default=0.3,
+        help="False-positive penalty in Tversky loss.",
+    )
+    parser.add_argument(
+        "--tversky-beta",
+        type=float,
+        default=0.7,
+        help="False-negative penalty in Tversky loss.",
+    )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument(
         "--thresholds",
@@ -402,10 +500,21 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.bce_weight < 0 or args.dice_weight < 0:
+    if any(
+        weight < 0
+        for weight in (
+            args.bce_weight,
+            args.dice_weight,
+            args.tversky_weight,
+        )
+    ):
         raise ValueError("Loss weights must be non-negative")
-    if args.bce_weight + args.dice_weight == 0:
+    if args.bce_weight + args.dice_weight + args.tversky_weight == 0:
         raise ValueError("At least one loss weight must be positive")
+    if args.tversky_alpha < 0 or args.tversky_beta < 0:
+        raise ValueError("Tversky alpha and beta must be non-negative")
+    if args.tversky_alpha + args.tversky_beta == 0:
+        raise ValueError("At least one Tversky penalty must be positive")
     if not 0 <= args.threshold <= 1:
         raise ValueError("Threshold must be between 0 and 1")
     if not args.thresholds or any(
@@ -506,8 +615,11 @@ def main():
             device,
             args.bce_weight,
             args.dice_weight,
-            optimizer,
-            args.threshold,
+            args.tversky_weight,
+            args.tversky_alpha,
+            args.tversky_beta,
+            optimizer=optimizer,
+            threshold=args.threshold,
         )
         val_metrics, validation_results = validate_epoch(
             model,
@@ -515,6 +627,9 @@ def main():
             device,
             args.bce_weight,
             args.dice_weight,
+            args.tversky_weight,
+            args.tversky_alpha,
+            args.tversky_beta,
             args.thresholds,
             args.threshold,
         )
@@ -552,6 +667,9 @@ def main():
                     "base_channels": args.base_channels,
                     "bce_weight": args.bce_weight,
                     "dice_weight": args.dice_weight,
+                    "tversky_weight": args.tversky_weight,
+                    "tversky_alpha": args.tversky_alpha,
+                    "tversky_beta": args.tversky_beta,
                     "threshold": args.threshold,
                     "inference_threshold": epoch_threshold,
                     "validation_dice": best_val_dice,
@@ -574,6 +692,9 @@ def main():
         device,
         args.bce_weight,
         args.dice_weight,
+        args.tversky_weight,
+        args.tversky_alpha,
+        args.tversky_beta,
         threshold=best_threshold,
     )
     print(f"Lowest observed validation loss: {best_val_loss:.6f}")
@@ -587,16 +708,47 @@ def main():
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Test precision: {test_metrics['precision']:.4f}")
     print(f"Test recall: {test_metrics['recall']:.4f}")
-    tolerant_metrics = boundary_tolerant_metrics(
+    validation_tolerant_results = boundary_tolerant_threshold_metrics(
+        model,
+        val_loader,
+        device,
+        args.thresholds,
+        args.boundary_tolerances,
+    )
+    tolerant_thresholds = {
+        radius: max(
+            args.thresholds,
+            key=lambda threshold: results[threshold]["dice"],
+        )
+        for radius, results in validation_tolerant_results.items()
+    }
+    checkpoint["boundary_tolerant_thresholds"] = tolerant_thresholds
+    checkpoint["boundary_tolerant_validation_metrics"] = {
+        radius: validation_tolerant_results[radius][threshold]
+        for radius, threshold in tolerant_thresholds.items()
+    }
+    torch.save(checkpoint, args.checkpoint)
+    for radius, threshold in tolerant_thresholds.items():
+        metrics = validation_tolerant_results[radius][threshold]
+        print(
+            f"Selected tolerance {radius} px threshold {threshold:.2f}: "
+            f"validation dice={metrics['dice']:.4f} "
+            f"precision={metrics['precision']:.4f} "
+            f"recall={metrics['recall']:.4f}"
+        )
+
+    test_tolerant_results = boundary_tolerant_threshold_metrics(
         model,
         test_loader,
         device,
-        best_threshold,
+        tolerant_thresholds.values(),
         args.boundary_tolerances,
     )
-    for radius, metrics in tolerant_metrics.items():
+    for radius, threshold in tolerant_thresholds.items():
+        metrics = test_tolerant_results[radius][threshold]
         print(
-            f"Test tolerance {radius} px: dice={metrics['dice']:.4f} "
+            f"Test tolerance {radius} px at threshold {threshold:.2f}: "
+            f"dice={metrics['dice']:.4f} "
             f"precision={metrics['precision']:.4f} "
             f"recall={metrics['recall']:.4f}"
         )
