@@ -11,6 +11,7 @@ from train import (
     make_dataset,
     run_epoch,
 )
+from visualize_results import visualize_test_region_maps
 
 
 def parse_args():
@@ -162,6 +163,18 @@ def main():
             f"precision={test['precision']:.4f} "
             f"recall={test['recall']:.4f}"
         )
+
+    visualize_test_region_maps(
+        model,
+        X,
+        y,
+        test_region,
+        device,
+        patch_size,
+        exact_threshold,
+        output="test_region_maps.png",
+        batch_size=args.batch_size,
+    )
 
 
 if __name__ == "__main__":

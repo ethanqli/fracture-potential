@@ -1,5 +1,6 @@
 import argparse
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
@@ -9,7 +10,11 @@ from dataset import FracturePatchDataset
 from load_data import load_raw_data, normalize_predictors
 from model import UNet
 from spatial_split import make_spatial_splits
-from visualize_results import plot_training_history, visualize_test_predictions
+from visualize_results import (
+    plot_training_history,
+    visualize_test_predictions,
+    visualize_test_region_maps,
+)
 
 
 def masked_bce_loss(logits, targets, ice_mask):
@@ -552,7 +557,17 @@ def main():
         print("Computing distance to the nearest non-ice pixel...")
         # Distances are only used for integer bins; uint16 halves memory versus
         # float32 and easily covers this raster's dimensions.
-        boundary_distance = distance_transform_edt(X[7] > 0).astype("uint16")
+        distance_result = distance_transform_edt(
+            X[7] > 0,
+            return_distances=True,
+            return_indices=False,
+        )
+        # SciPy can return a tuple when indices are requested. Keep the runtime
+        # guard, then convert through NumPy to avoid the overly broad return
+        # type exposed by some SciPy/Pylance stub versions.
+        if isinstance(distance_result, tuple):
+            raise RuntimeError("Expected distance_transform_edt to return an array")
+        boundary_distance = np.asarray(distance_result, dtype=np.uint16)
     density_bounds = (32, 128) if args.stratified_positive_sampling else None
 
     train_dataset = make_dataset(
@@ -770,6 +785,17 @@ def main():
         device,
         best_threshold,
         output="test_predictions.png",
+    )
+    visualize_test_region_maps(
+        model,
+        X,
+        y,
+        test_region,
+        device,
+        args.patch_size,
+        best_threshold,
+        output="test_region_maps.png",
+        batch_size=args.batch_size,
     )
 
 

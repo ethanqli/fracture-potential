@@ -13,6 +13,8 @@ import torch
 from matplotlib.colors import ListedColormap
 from torch.utils.data import DataLoader
 
+from full_raster_inference import predict_full_raster
+
 
 def plot_training_history(history, output="training_curves.png"):
     """Save train/validation loss and Dice curves from a training run."""
@@ -54,6 +56,100 @@ def plot_training_history(history, output="training_curves.png"):
     fig.savefig(output, dpi=180, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved training curves to {output}")
+
+
+def _max_pool_for_display(array, max_display_size):
+    """Reduce a binary raster while preserving isolated positive pixels."""
+    height, width = array.shape
+    factor = max(1, int(np.ceil(max(height, width) / max_display_size)))
+    if factor == 1:
+        return array
+
+    padded_height = int(np.ceil(height / factor) * factor)
+    padded_width = int(np.ceil(width / factor) * factor)
+    padded = np.zeros((padded_height, padded_width), dtype=bool)
+    padded[:height, :width] = array
+    return padded.reshape(
+        padded_height // factor, factor, padded_width // factor, factor
+    ).max(axis=(1, 3))
+
+
+def visualize_test_region_maps(
+    model,
+    X,
+    target,
+    test_region,
+    device,
+    patch_size,
+    threshold,
+    output="test_region_maps.png",
+    batch_size=32,
+    stride=None,
+    max_display_size=1200,
+):
+    """Save four overview maps covering the complete held-out test region."""
+    if X.ndim != 3 or target.shape != X.shape[1:]:
+        raise ValueError("X and target have incompatible shapes")
+    if test_region.shape != target.shape or not test_region.any():
+        raise ValueError("test_region must be a non-empty mask matching target")
+    if not 0 <= threshold <= 1:
+        raise ValueError("threshold must be between 0 and 1")
+    if max_display_size <= 0:
+        raise ValueError("max_display_size must be positive")
+
+    rows, cols = np.where(test_region)
+    row_start, row_stop = int(rows.min()), int(rows.max()) + 1
+    col_start, col_stop = int(cols.min()), int(cols.max()) + 1
+
+    # Include surrounding context so predictions at the test-region boundary do
+    # not suffer from artificial crop edges. Only the held-out area is plotted.
+    context = patch_size
+    input_row_start = max(0, row_start - context)
+    input_row_stop = min(X.shape[1], row_stop + context)
+    input_col_start = max(0, col_start - context)
+    input_col_stop = min(X.shape[2], col_stop + context)
+    X_crop = X[
+        :,
+        input_row_start:input_row_stop,
+        input_col_start:input_col_stop,
+    ]
+    probability_crop = predict_full_raster(
+        model,
+        X_crop,
+        device,
+        patch_size=patch_size,
+        batch_size=batch_size,
+        stride=stride,
+    )
+    probability = probability_crop[
+        row_start - input_row_start:row_stop - input_row_start,
+        col_start - input_col_start:col_stop - input_col_start,
+    ]
+
+    valid = test_region[row_start:row_stop, col_start:col_stop]
+    valid &= X[7, row_start:row_stop, col_start:col_stop] > 0
+    truth = (target[row_start:row_stop, col_start:col_stop] > 0) & valid
+    prediction = (probability >= threshold) & valid
+    maps = (
+        (truth, "Ground truth", "Reds"),
+        (prediction, f"Prediction (p >= {threshold:.2f})", "Blues"),
+        (prediction & ~truth, "False positives", "Oranges"),
+        (~prediction & truth & valid, "False negatives", "Purples"),
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    extent = (col_start, col_stop, row_stop, row_start)
+    for ax, (values, title, cmap) in zip(axes.flat, maps):
+        display = _max_pool_for_display(values, max_display_size)
+        ax.imshow(display, cmap=cmap, vmin=0, vmax=1, extent=extent, aspect="auto")
+        ax.set_title(f"{title} ({int(values.sum()):,} pixels)")
+        ax.set_xlabel("Raster column")
+        ax.set_ylabel("Raster row")
+
+    fig.suptitle("Held-out test-region overview")
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved test-region overview to {output}")
 
 
 def visualize_test_predictions(
