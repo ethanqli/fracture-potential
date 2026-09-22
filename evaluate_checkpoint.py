@@ -9,6 +9,7 @@ from spatial_split import make_spatial_splits
 from train import (
     boundary_tolerant_threshold_metrics,
     make_dataset,
+    pixel_auc_metrics,
     run_epoch,
 )
 from visualize_results import visualize_test_region_maps
@@ -125,6 +126,13 @@ def main():
         f"dice={test_metrics['dice']:.4f} "
         f"precision={test_metrics['precision']:.4f} "
         f"recall={test_metrics['recall']:.4f}"
+    )
+    auc_metrics = pixel_auc_metrics(model, test_loader, device)
+    print(
+        "Sampled test valid-ice pixels: "
+        f"PR-AUC (average precision)={auc_metrics['pr_auc']:.4f} "
+        f"ROC-AUC={auc_metrics['roc_auc']:.4f} "
+        f"fracture prevalence={auc_metrics['prevalence']:.4f}"
     )
 
     validation_results = boundary_tolerant_threshold_metrics(

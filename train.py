@@ -121,6 +121,56 @@ def segmentation_metrics(true_positives, false_positives, false_negatives):
     return {"dice": dice, "precision": precision, "recall": recall}
 
 
+def auc_from_scores(targets, scores):
+    """Exact pixel average precision and ROC-AUC, with tied scores grouped."""
+    targets = np.asarray(targets, dtype=bool).ravel()
+    scores = np.asarray(scores).ravel()
+    if targets.size != scores.size or targets.size == 0:
+        raise ValueError("Targets and scores must have the same nonzero size")
+    if not np.isfinite(scores).all():
+        raise ValueError("Scores must be finite")
+
+    positives = int(targets.sum())
+    negatives = targets.size - positives
+    prevalence = positives / targets.size
+    if positives == 0 or negatives == 0:
+        return {"pr_auc": float("nan"), "roc_auc": float("nan"),
+                "prevalence": prevalence}
+
+    order = np.argsort(-scores, kind="stable")
+    sorted_scores = scores[order]
+    sorted_targets = targets[order]
+    ends = np.r_[np.flatnonzero(np.diff(sorted_scores)), targets.size - 1]
+    true_positives = np.cumsum(sorted_targets)[ends]
+    false_positives = ends + 1 - true_positives
+    precision = true_positives / (true_positives + false_positives)
+    recall = true_positives / positives
+    # Average precision is the step-wise area under the PR curve.
+    pr_auc = np.sum(np.diff(np.r_[0.0, recall]) * precision)
+    fpr = false_positives / negatives
+    roc_auc = np.trapezoid(np.r_[0.0, recall], np.r_[0.0, fpr])
+    return {"pr_auc": float(pr_auc), "roc_auc": float(roc_auc),
+            "prevalence": prevalence}
+
+
+def pixel_auc_metrics(model, loader, device):
+    """Score only valid ice pixels from sampled evaluation patches."""
+    all_targets = []
+    all_scores = []
+    model.eval()
+    with torch.inference_mode():
+        for X_batch, y_batch, ice_batch in loader:
+            probabilities = torch.sigmoid(model(X_batch.to(device))).cpu()
+            valid = ice_batch > 0
+            all_targets.append((y_batch[valid] > 0.5).numpy())
+            all_scores.append(probabilities[valid].numpy())
+    if not all_targets:
+        raise ValueError("Evaluation loader is empty")
+    return auc_from_scores(
+        np.concatenate(all_targets), np.concatenate(all_scores)
+    )
+
+
 def dilate_binary_mask(mask, radius):
     """Dilate a BCHW Boolean mask by an integer pixel radius."""
     if radius < 0:
@@ -723,6 +773,13 @@ def main():
     print(f"Test Dice: {test_metrics['dice']:.4f}")
     print(f"Test precision: {test_metrics['precision']:.4f}")
     print(f"Test recall: {test_metrics['recall']:.4f}")
+    auc_metrics = pixel_auc_metrics(model, test_loader, device)
+    print(
+        "Sampled test valid-ice pixels: "
+        f"PR-AUC (average precision)={auc_metrics['pr_auc']:.4f} "
+        f"ROC-AUC={auc_metrics['roc_auc']:.4f} "
+        f"fracture prevalence={auc_metrics['prevalence']:.4f}"
+    )
     validation_tolerant_results = boundary_tolerant_threshold_metrics(
         model,
         val_loader,
