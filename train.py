@@ -11,6 +11,7 @@ from load_data import load_raw_data, normalize_predictors
 from model import UNet
 from spatial_split import make_spatial_splits
 from visualize_results import (
+    plot_auc_curves,
     plot_training_history,
     visualize_test_predictions,
     visualize_test_region_maps,
@@ -121,8 +122,8 @@ def segmentation_metrics(true_positives, false_positives, false_negatives):
     return {"dice": dice, "precision": precision, "recall": recall}
 
 
-def auc_from_scores(targets, scores):
-    """Exact pixel average precision and ROC-AUC, with tied scores grouped."""
+def binary_classification_curves(targets, scores):
+    """Return exact PR/ROC curves and areas, grouping tied scores."""
     targets = np.asarray(targets, dtype=bool).ravel()
     scores = np.asarray(scores).ravel()
     if targets.size != scores.size or targets.size == 0:
@@ -134,8 +135,7 @@ def auc_from_scores(targets, scores):
     negatives = targets.size - positives
     prevalence = positives / targets.size
     if positives == 0 or negatives == 0:
-        return {"pr_auc": float("nan"), "roc_auc": float("nan"),
-                "prevalence": prevalence}
+        raise ValueError("AUC curves require both positive and negative targets")
 
     order = np.argsort(-scores, kind="stable")
     sorted_scores = scores[order]
@@ -149,8 +149,29 @@ def auc_from_scores(targets, scores):
     pr_auc = np.sum(np.diff(np.r_[0.0, recall]) * precision)
     fpr = false_positives / negatives
     roc_auc = np.trapezoid(np.r_[0.0, recall], np.r_[0.0, fpr])
-    return {"pr_auc": float(pr_auc), "roc_auc": float(roc_auc),
-            "prevalence": prevalence}
+    return {
+        "precision": np.r_[1.0, precision],
+        "recall": np.r_[0.0, recall],
+        "fpr": np.r_[0.0, fpr],
+        "tpr": np.r_[0.0, recall],
+        "thresholds": sorted_scores[ends],
+        "pr_auc": float(pr_auc),
+        "roc_auc": float(roc_auc),
+        "prevalence": prevalence,
+    }
+
+
+def auc_from_scores(targets, scores):
+    """Return scalar pixel average precision, ROC-AUC, and prevalence."""
+    targets = np.asarray(targets, dtype=bool).ravel()
+    if targets.size == 0:
+        raise ValueError("Targets must be non-empty")
+    prevalence = float(targets.mean())
+    if targets.all() or not targets.any():
+        return {"pr_auc": float("nan"), "roc_auc": float("nan"),
+                "prevalence": prevalence}
+    curves = binary_classification_curves(targets, scores)
+    return {name: curves[name] for name in ("pr_auc", "roc_auc", "prevalence")}
 
 
 def pixel_auc_metrics(model, loader, device):
@@ -166,7 +187,7 @@ def pixel_auc_metrics(model, loader, device):
             all_scores.append(probabilities[valid].numpy())
     if not all_targets:
         raise ValueError("Evaluation loader is empty")
-    return auc_from_scores(
+    return binary_classification_curves(
         np.concatenate(all_targets), np.concatenate(all_scores)
     )
 
@@ -780,6 +801,7 @@ def main():
         f"ROC-AUC={auc_metrics['roc_auc']:.4f} "
         f"fracture prevalence={auc_metrics['prevalence']:.4f}"
     )
+    plot_auc_curves(auc_metrics, output="auc_curves.png")
     validation_tolerant_results = boundary_tolerant_threshold_metrics(
         model,
         val_loader,

@@ -12,7 +12,7 @@ from train import (
     pixel_auc_metrics,
     run_epoch,
 )
-from visualize_results import visualize_test_region_maps
+from visualize_results import plot_auc_curves, visualize_test_region_maps
 
 
 def parse_args():
@@ -134,6 +134,7 @@ def main():
         f"ROC-AUC={auc_metrics['roc_auc']:.4f} "
         f"fracture prevalence={auc_metrics['prevalence']:.4f}"
     )
+    plot_auc_curves(auc_metrics, output="auc_curves.png")
 
     validation_results = boundary_tolerant_threshold_metrics(
         model,

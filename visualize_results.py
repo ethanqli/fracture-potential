@@ -16,6 +16,53 @@ from torch.utils.data import DataLoader
 from full_raster_inference import predict_full_raster
 
 
+def plot_auc_curves(curves, output="auc_curves.png"):
+    """Save precision-recall and ROC curves from pixel-level scores."""
+    required = {
+        "precision", "recall", "fpr", "tpr", "pr_auc", "roc_auc",
+        "prevalence",
+    }
+    missing = required.difference(curves)
+    if missing:
+        raise ValueError(f"Curve data is missing: {', '.join(sorted(missing))}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    axes[0].step(
+        curves["recall"], curves["precision"], where="post",
+        label=f"Model (AP = {curves['pr_auc']:.3f})",
+    )
+    axes[0].axhline(
+        curves["prevalence"], color="gray", linestyle="--",
+        label=f"Random baseline = {curves['prevalence']:.3f}",
+    )
+    axes[0].set(
+        title="Precision–recall curve", xlabel="Recall", ylabel="Precision",
+        xlim=(0, 1), ylim=(0, 1),
+    )
+
+    axes[1].plot(
+        curves["fpr"], curves["tpr"],
+        label=f"Model (AUC = {curves['roc_auc']:.3f})",
+    )
+    axes[1].plot(
+        [0, 1], [0, 1], color="gray", linestyle="--",
+        label="Random baseline",
+    )
+    axes[1].set(
+        title="ROC curve", xlabel="False-positive rate",
+        ylabel="True-positive rate", xlim=(0, 1), ylim=(0, 1),
+    )
+    for ax in axes:
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best")
+        ax.set_aspect("equal", adjustable="box")
+    fig.suptitle("Sampled test valid-ice pixels")
+    fig.tight_layout()
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved AUC curves to {output}")
+
+
 def plot_training_history(history, output="training_curves.png"):
     """Save train/validation loss and Dice curves from a training run."""
     required = {"train_loss", "val_loss", "train_dice", "val_dice"}
