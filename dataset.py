@@ -26,6 +26,7 @@ class FracturePatchDataset(Dataset):
         boundary_distance=None,
         boundary_upper_bounds=(8, 32, 128),
         min_positive_pixels=8,
+        input_channel_indices=None,
     ):
         self.X_full = X_full
         self.y_full = y_full
@@ -41,6 +42,18 @@ class FracturePatchDataset(Dataset):
         self.boundary_distance = boundary_distance
         self.boundary_upper_bounds = boundary_upper_bounds
         self.min_positive_pixels = min_positive_pixels
+        self.input_channel_indices = tuple(
+            range(X_full.shape[0])
+            if input_channel_indices is None
+            else input_channel_indices
+        )
+        if not self.input_channel_indices:
+            raise ValueError("At least one model input channel is required")
+        if (
+            min(self.input_channel_indices) < 0
+            or max(self.input_channel_indices) >= X_full.shape[0]
+        ):
+            raise ValueError("Model input channel index is out of range")
         if augment and (
             normalization_stats is None
             or 1 not in normalization_stats
@@ -165,4 +178,5 @@ class FracturePatchDataset(Dataset):
             X_patch[1] = torch.where(velocity_valid, X_patch[1], 0.0)
             X_patch[2] = torch.where(velocity_valid, X_patch[2], 0.0)
 
+        X_patch = X_patch[list(self.input_channel_indices)]
         return X_patch, y_patch, ice_patch

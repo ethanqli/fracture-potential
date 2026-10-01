@@ -50,9 +50,12 @@ def main():
     X = normalize_predictors_with_stats(
         X_raw, checkpoint["normalization_stats"], copy=False
     )
+    input_channel_indices = tuple(
+        checkpoint.get("input_channel_indices", range(checkpoint["input_channels"]))
+    )
     potential = predict_full_raster(
         model,
-        X,
+        X[list(input_channel_indices)],
         device,
         patch_size=checkpoint["patch_size"],
         batch_size=args.batch_size,

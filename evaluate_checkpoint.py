@@ -64,6 +64,9 @@ def main():
     )
     patch_size = checkpoint["patch_size"]
     base_channels = checkpoint["base_channels"]
+    input_channel_indices = tuple(
+        checkpoint.get("input_channel_indices", range(checkpoint["input_channels"]))
+    )
 
     X_raw, y = load_raw_data()
     _, height, width = X_raw.shape
@@ -83,6 +86,7 @@ def main():
         args.val_per_class,
         args.seed + 1,
         min_positive_pixels=args.evaluation_min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
     test_dataset = make_dataset(
         X,
@@ -93,6 +97,7 @@ def main():
         args.test_per_class,
         args.seed + 2,
         min_positive_pixels=args.evaluation_min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
     loader_args = {
         "batch_size": args.batch_size,
@@ -183,6 +188,7 @@ def main():
         exact_threshold,
         output="test_region_maps.png",
         batch_size=args.batch_size,
+        input_channel_indices=input_channel_indices,
     )
 
 

@@ -133,6 +133,7 @@ def visualize_test_region_maps(
     batch_size=32,
     stride=None,
     max_display_size=1200,
+    input_channel_indices=None,
 ):
     """Save four overview maps covering the complete held-out test region."""
     if X.ndim != 3 or target.shape != X.shape[1:]:
@@ -155,8 +156,13 @@ def visualize_test_region_maps(
     input_row_stop = min(X.shape[1], row_stop + context)
     input_col_start = max(0, col_start - context)
     input_col_stop = min(X.shape[2], col_stop + context)
+    input_channel_indices = tuple(
+        range(X.shape[0])
+        if input_channel_indices is None
+        else input_channel_indices
+    )
     X_crop = X[
-        :,
+        list(input_channel_indices),
         input_row_start:input_row_stop,
         input_col_start:input_col_stop,
     ]
@@ -305,8 +311,15 @@ def visualize_test_predictions(
             prediction = (probability >= threshold) & valid
             probability = np.where(valid, probability, np.nan)
 
-            # Channel zero is normalized ice thickness.
-            thickness = np.ma.masked_where(~valid, X_patch[0].numpy())
+            if 0 in dataset.input_channel_indices:
+                thickness_index = dataset.input_channel_indices.index(0)
+                context_image = np.ma.masked_where(
+                    ~valid, X_patch[thickness_index].numpy()
+                )
+                context_title = "Thickness"
+            else:
+                context_image = np.ma.masked_where(~valid, valid)
+                context_title = "Valid ice mask"
             results = np.zeros(target.shape, dtype=np.uint8)
             results[prediction & target] = 1
             results[prediction & ~target] = 2
@@ -314,7 +327,7 @@ def visualize_test_predictions(
             results = np.ma.masked_where(~valid, results)
 
             panels = (
-                (thickness, "Thickness", "gray", None, None),
+                (context_image, context_title, "gray", None, None),
                 (np.ma.masked_where(~valid, target), "Ground truth", "gray", 0, 1),
                 (probability, "Fracture probability", "magma", 0, 1),
                 (np.ma.masked_where(~valid, prediction), f"Prediction >= {threshold:.2f}", "gray", 0, 1),

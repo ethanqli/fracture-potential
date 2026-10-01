@@ -12,7 +12,36 @@ PREDICTOR_PATHS = [
     "mask_500m.tif",
     "velocity_mask_500.tif",
 ]
+PREDICTOR_NAMES = (
+    "thickness",
+    "vx",
+    "vy",
+    "surface",
+    "bed",
+    "effective_strain_rate",
+    "effective_stress",
+    "mask",
+    "velocity_mask",
+)
 TARGET_PATH = "frac_map_500m_on_ice.tif"
+
+
+def select_input_channels(drop_channels=()):
+    """Return retained predictor indices after validating names to drop."""
+    dropped = set(drop_channels)
+    unknown = dropped.difference(PREDICTOR_NAMES)
+    if unknown:
+        choices = ", ".join(PREDICTOR_NAMES)
+        raise ValueError(
+            f"Unknown predictor channel(s): {', '.join(sorted(unknown))}. "
+            f"Choose from: {choices}"
+        )
+    retained = tuple(
+        index for index, name in enumerate(PREDICTOR_NAMES) if name not in dropped
+    )
+    if not retained:
+        raise ValueError("At least one predictor channel must be retained")
+    return retained
 
 
 def normalize_channel(arr, statistics_valid, output_valid=None):

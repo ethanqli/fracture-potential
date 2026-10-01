@@ -7,7 +7,12 @@ from scipy.ndimage import distance_transform_edt
 from torch.utils.data import DataLoader
 
 from dataset import FracturePatchDataset
-from load_data import load_raw_data, normalize_predictors
+from load_data import (
+    PREDICTOR_NAMES,
+    load_raw_data,
+    normalize_predictors,
+    select_input_channels,
+)
 from model import UNet
 from spatial_split import make_spatial_splits
 from visualize_results import (
@@ -483,6 +488,7 @@ def make_dataset(
     positive_density_upper_bounds=None,
     boundary_distance=None,
     min_positive_pixels=8,
+    input_channel_indices=None,
 ):
     return FracturePatchDataset(
         X_full=X,
@@ -498,6 +504,7 @@ def make_dataset(
         positive_density_upper_bounds=positive_density_upper_bounds,
         boundary_distance=boundary_distance,
         min_positive_pixels=min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
 
 
@@ -511,6 +518,13 @@ def parse_args():
     parser.add_argument("--val-per-class", type=int, default=20)
     parser.add_argument("--test-per-class", type=int, default=20)
     parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument(
+        "--drop-channels",
+        nargs="*",
+        choices=PREDICTOR_NAMES,
+        default=(),
+        help="Predictor channels to exclude from the model input.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--dice-weight", type=float, default=0.5)
@@ -621,7 +635,12 @@ def main():
     X, normalization_stats = normalize_predictors(
         X_raw, train_region, copy=False
     )
+    input_channel_indices = select_input_channels(args.drop_channels)
+    input_channel_names = tuple(
+        PREDICTOR_NAMES[index] for index in input_channel_indices
+    )
     print("X shape:", X.shape, "y shape:", y.shape)
+    print("Model input channels:", ", ".join(input_channel_names))
 
     boundary_distance = None
     if args.boundary_matched_negatives:
@@ -648,16 +667,19 @@ def main():
         positive_density_upper_bounds=density_bounds,
         boundary_distance=boundary_distance,
         min_positive_pixels=args.training_min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
     val_dataset = make_dataset(
         X, y, val_region, args.patch_size,
         args.val_per_class, args.val_per_class, args.seed + 1,
         min_positive_pixels=args.evaluation_min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
     test_dataset = make_dataset(
         X, y, test_region, args.patch_size,
         args.test_per_class, args.test_per_class, args.seed + 2,
         min_positive_pixels=args.evaluation_min_positive_pixels,
+        input_channel_indices=input_channel_indices,
     )
     if args.stratified_positive_sampling:
         print("Training positive density-bin counts:", train_dataset.positive_density_counts)
@@ -674,7 +696,7 @@ def main():
     test_loader = DataLoader(test_dataset, shuffle=False, **loader_args)
 
     model = UNet(
-        in_channels=X.shape[0],
+        in_channels=len(input_channel_indices),
         out_channels=1,
         base_channels=args.base_channels,
     ).to(device)
@@ -748,7 +770,10 @@ def main():
                     "epoch": epoch + 1,
                     "model_state_dict": model.state_dict(),
                     "normalization_stats": normalization_stats,
-                    "input_channels": X.shape[0],
+                    "input_channels": len(input_channel_indices),
+                    "input_channel_indices": input_channel_indices,
+                    "input_channel_names": input_channel_names,
+                    "dropped_channels": tuple(args.drop_channels),
                     "patch_size": args.patch_size,
                     "base_channels": args.base_channels,
                     "bce_weight": args.bce_weight,
@@ -875,6 +900,7 @@ def main():
         best_threshold,
         output="test_region_maps.png",
         batch_size=args.batch_size,
+        input_channel_indices=input_channel_indices,
     )
 
 
