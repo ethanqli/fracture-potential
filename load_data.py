@@ -23,7 +23,7 @@ PREDICTOR_NAMES = (
     "mask",
     "velocity_mask",
 )
-TARGET_PATH = "frac_map_500m_on_ice.tif"
+TARGET_PATH = "frac_loc_500m.tif"
 
 
 def select_input_channels(drop_channels=()):
